@@ -2,14 +2,10 @@
 name = "a-s-p"
 version = "0.1.0"
 description = "Two-agent forensic analysis and behavioral profiling pipeline: Gradio UI, A2A agent servers, Postgres checkpoints"
-readme = "README.md"
+readme = "../README.md"
 requires-python = ">=3.13"
 dependencies = [
-    # ── app / servers ──
     "asyncpg>=0.30.0",
-    # Pinned (not just floored) on purpose: a2a_client.py is hand-written against this exact
-    # wire format. If you deliberately upgrade it, regenerate uv.lock AND re-verify the client
-    # against the new version's schema (see a2a_client.py's docstring).
     "fasta2a[pydantic-ai]==2.0.1",
     "fastmcp>=4.0.3",
     "gradio>=6.19.0",
@@ -17,24 +13,18 @@ dependencies = [
     "pydantic-ai-slim>=2.42.0",
     "python-dotenv>=1.2.2",
     "uvicorn>=0.46.0",
-    # ── RAG ──
     "faiss-cpu>=1.9.0",
     "langchain-community>=0.4.0",
     "langchain-core>=1.0.0",
     "langchain-huggingface>=0.3.0",
     "langchain-text-splitters>=1.0.0",
     "sentence-transformers>=3.0.0",
-    # ── local model inference (qwen_agents/model_utils.py) ──
     "torch>=2.12.1",
     "transformers>=5.1.0,<=5.5.0",
     "huggingface-hub>=1.20.1",
-    # Needed at runtime but only ever installed transitively before:
-    #   accelerate     - device_map="cuda" loading
-    #   peft           - adapter-only model repos
-    #   bitsandbytes   - the optional *_LOAD_IN_4BIT mode
-    #   torchvision    - transformers' Qwen3-VL video/image processors require it
     "accelerate>=1.15.0",
     "peft>=0.20.0",
     "bitsandbytes>=0.50.2",
     "torchvision>=0.27.1",
+    "pillow>=12.2.0",
 ]

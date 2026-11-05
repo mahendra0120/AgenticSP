@@ -1,6 +1,6 @@
 import os
 from pydantic_ai import Agent
-from qwen_agents.model_utils import make_model
+from qwen_agents.model_utils import QwenVLModel
 
 FORENSIC_MODEL_ID = os.getenv(
     "FORENSIC_MODEL_ID",
@@ -12,12 +12,12 @@ FORENSIC_LOAD_IN_4BIT = os.getenv("FORENSIC_LOAD_IN_4BIT", "false").strip().lowe
 )
 
 forensic_agent: Agent[None, str] = Agent(
-    model=make_model(
+    model=QwenVLModel(
         FORENSIC_MODEL_ID,
         processor_path="Qwen/Qwen3-VL-8B-Thinking",
         max_new_tokens=6144,
         load_in_4bit=FORENSIC_LOAD_IN_4BIT
-    ),
+    ).function_model(),
     system_prompt=(
         "You are a forensic pathology assistant. You are given only "
         "autopsy photographs — no written report, case file, or "

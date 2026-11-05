@@ -2,15 +2,18 @@ from __future__ import annotations
 import env_defaults 
 import torch
 import asyncio
+import io
 import json
 import logging
 import os
 import re
 import threading
 import uuid
+from contextlib import aclosing
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
+from PIL import Image
 from transformers import AutoModelForImageTextToText
 from huggingface_hub import login, snapshot_download
 from pydantic_ai.messages import (
@@ -33,7 +36,7 @@ log = logging.getLogger("model_utils")
 
 if os.getenv("HF_TOKEN"):
     if os.getenv("HF_HUB_OFFLINE"):
-        log.info("HF_HUB_OFFLINE is set — skipping huggingface_hub login() (relying on locally cached model weights).")
+        log.info("HF_HUB_OFFLINE is set;skipping huggingface_hub login().")
     else:
         login(token=os.getenv("HF_TOKEN"))
 
@@ -108,7 +111,7 @@ def load_with_transformers(local_path: str, processor_path: Optional[str], load_
     if processor is None:
         raise RuntimeError(
             f"Model loaded, but no usable image processor was found. Tried: {errors}. "
-            f"Pass processor_path (e.g. 'Qwen/Qwen3-VL-8B-Thinking') to make_model()."
+            f"Pass processor_path (e.g. 'Qwen/Qwen3-VL-8B-Thinking') to QwenVLModel()."
         )
     return model, processor
 
@@ -116,6 +119,27 @@ def load_with_transformers(local_path: str, processor_path: Optional[str], load_
 @lru_cache(maxsize=4)
 def load(model_id: str, processor_path: Optional[str], load_in_4bit: bool):
     return load_with_transformers(download(model_id), processor_path, load_in_4bit)
+
+
+def is_image_content(piece) -> bool:
+    return isinstance(piece, BinaryContent) and piece.is_image
+
+
+def tool_return_items(part: ToolReturnPart) -> list[dict]:
+    pieces = part.content if isinstance(part.content, (list, tuple)) else [part.content]
+    header = f"Tool '{part.tool_name}' returned:\n"
+    if not any(is_image_content(p) for p in pieces):
+        return [{"type": "text", "text": header + part.model_response_str()}]
+    items: list[dict] = [{"type": "text", "text": header.rstrip()}]
+    for piece in pieces:
+        if is_image_content(piece):
+            picture = Image.open(io.BytesIO(piece.data)).convert("RGB")
+            items.append({"type": "image", "image": picture})
+        elif isinstance(piece, str):
+            items.append({"type": "text", "text": piece})
+        else:
+            items.append({"type": "text", "text": json.dumps(piece, default=str)})
+    return items
 
 
 def extract_chat_messages(messages: list[ModelMessage]) -> list[dict]:
@@ -141,11 +165,7 @@ def extract_chat_messages(messages: list[ModelMessage]) -> list[dict]:
                         elif isinstance(piece, DocumentUrl):
                             user_content_items.append({"type": "image", "image": piece.url})
                 elif isinstance(part, ToolReturnPart):
-                    tool_text = (
-                        f"Tool '{part.tool_name}' returned:\n"
-                        f"{part.model_response_str()}"
-                    )
-                    user_content_items.append({"type": "text", "text": tool_text})
+                    user_content_items.extend(tool_return_items(part))
             if user_content_items:
                 chat.append({"role": "user", "content": user_content_items})
         elif isinstance(msg, ModelResponse):
@@ -184,71 +204,6 @@ def build_tool_instructions(agent_info: AgentInfo) -> Optional[str]:
     )
 
 
-def build_chat_and_inputs(
-    model,
-    processor,
-    model_id: str,
-    messages: list[ModelMessage],
-    agent_info: AgentInfo,
-    reference_images: Optional[list],
-):
-    chat = extract_chat_messages(messages)
-
-    is_first_turn = not any(isinstance(m, ModelResponse) for m in messages)
-    if reference_images and is_first_turn:
-        ref_content = [
-            {"type": "text", "text": "Reference material (read this before analyzing the case):"}
-        ]
-        for img_path in reference_images:
-            ref_content.append({"type": "image", "image": str(img_path)})
-        chat.insert(0, {"role": "user", "content": ref_content})
-        log.info(f"[{model_id}] Attached {len(reference_images)} reference image(s)")
-
-    img_prsnt = any(
-        isinstance(m.get("content"), list)
-        and any(c.get("type") == "image" for c in m["content"])
-        for m in chat
-        if m["role"] == "user"
-    )
-    log.info(f"[{model_id}] Built chat with {len(chat)} turns (image attached: {img_prsnt})")
-
-    tool_instructions = build_tool_instructions(agent_info)
-    if tool_instructions:
-        chat.append(
-            {"role": "system", "content": [{"type": "text", "text": tool_instructions}]}
-        )
-        log.info(
-            f"[{model_id}] {len(agent_info.function_tools)} tool(s) available: "
-            f"{[t.name for t in agent_info.function_tools]}"
-        )
-
-    if agent_info.output_tools:
-        schema_hint = json.dumps([t.parameters_json_schema for t in agent_info.output_tools])
-        chat.append(
-            {
-                "role": "system",
-                "content": [{
-                    "type": "text",
-                    "text": (
-                        "Respond with ONLY a single JSON object matching this "
-                        f"schema, no prose, no markdown fences: {schema_hint}"
-                    ),
-                }],
-            }
-        )
-
-    inputs = processor.apply_chat_template(
-        chat,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
-    ).to(model.device)
-
-    tokenizer = getattr(processor, "tokenizer", processor)
-    return inputs, tokenizer
-
-
 def strip_thinking(raw_text: str) -> str:
     if "</think>" in raw_text:
         return raw_text.split("</think>", 1)[1]
@@ -267,33 +222,170 @@ def replace_special_tokens(text: str, tokenizer) -> str:
     return text
 
 
-def make_model(
-    model_id: str,
-    *,
-    processor_path: Optional[str] = None,
-    temperature: float = 0.15,
-    max_new_tokens: int = 6144,
-    reference_images: Optional[list] = None,
-    load_in_4bit: bool = False,
-) -> FunctionModel:
-    def out_kwargs(inputs, tokenizer) -> dict:
+@lru_cache(maxsize=None)
+def load_reference_image(path: str, max_side: int) -> Image.Image:
+    picture = Image.open(path).convert("RGB")
+    picture.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    return picture
+
+
+class StreamParser:
+    TOOL_CALL_PREFIX = "<tool_call>"
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.buffer = ""
+        self.past_think = False
+        self.mode: Optional[str] = None
+        self.emitted_len = 0
+        self.yielded_anything = False
+
+    @property
+    def has_tool_call(self) -> bool:
+        return self.mode == "tool_call" or (self.mode is None and self.TOOL_CALL_PREFIX in self.buffer)
+
+    def visible(self, text: str) -> str:
+        shown = replace_special_tokens(text, self.tokenizer)
+        if shown:
+            self.yielded_anything = True
+        return shown
+
+    def feed(self, chunk: str) -> str:
+        self.buffer += chunk
+        if not self.past_think:
+            if "</think>" not in self.buffer:
+                return ""
+            self.past_think = True
+
+        after = self.buffer.split("</think>", 1)[1]
+
+        if self.mode is None:
+            stripped = after.lstrip()
+            if not stripped:
+                return ""
+            if stripped.startswith(self.TOOL_CALL_PREFIX):
+                self.mode = "tool_call"
+                return ""
+            if self.TOOL_CALL_PREFIX.startswith(stripped):
+                return ""
+            self.mode = "text"
+            self.emitted_len = len(after)
+            return self.visible(after)
+
+        if self.mode == "text":
+            new_part = after[self.emitted_len:]
+            self.emitted_len = len(after)
+            return self.visible(new_part)
+        return ""
+
+
+class QwenVLModel:
+    CHUNK_TIMEOUT_S = 300.0
+    STOP_STRINGS = ["</tool_call>"]
+    REPETITION_PENALTY = 1.15
+
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        processor_path: Optional[str] = None,
+        temperature: float = 0.15,
+        max_new_tokens: int = 6144,
+        reference_images: Optional[list] = None,
+        reference_max_side: Optional[int] = 1600,
+        load_in_4bit: bool = False,
+    ):
+        self.model_id = model_id
+        self.processor_path = processor_path
+        self.temperature = temperature
+        self.max_new_tokens = max_new_tokens
+        self.reference_images = reference_images
+        self.reference_max_side = reference_max_side
+        self.load_in_4bit = load_in_4bit
+
+    def load(self):
+        return load(self.model_id, self.processor_path, self.load_in_4bit)
+
+    def reference_content(self) -> list[dict]:
+        content = [
+            {"type": "text", "text": "Reference material (read this before analyzing the case):"}
+        ]
+        for img_path in self.reference_images:
+            image = (
+                load_reference_image(str(img_path), self.reference_max_side)
+                if self.reference_max_side else str(img_path)
+            )
+            content.append({"type": "image", "image": image})
+        return content
+
+    def build_inputs(self, model, processor, messages: list[ModelMessage], agent_info: AgentInfo):
+        chat = extract_chat_messages(messages)
+
+        is_first_turn = not any(isinstance(m, ModelResponse) for m in messages)
+        if self.reference_images and is_first_turn:
+            chat.insert(0, {"role": "user", "content": self.reference_content()})
+            log.info(f"[{self.model_id}] Attached {len(self.reference_images)} reference image(s)")
+
+        img_prsnt = any(
+            isinstance(m.get("content"), list)
+            and any(c.get("type") == "image" for c in m["content"])
+            for m in chat
+            if m["role"] == "user"
+        )
+        log.info(f"[{self.model_id}] Built chat with {len(chat)} turns (image attached: {img_prsnt})")
+
+        tool_instructions = build_tool_instructions(agent_info)
+        if tool_instructions:
+            chat.append(
+                {"role": "system", "content": [{"type": "text", "text": tool_instructions}]}
+            )
+            log.info(
+                f"[{self.model_id}] {len(agent_info.function_tools)} tool(s) available: "
+                f"{[t.name for t in agent_info.function_tools]}"
+            )
+
+        if agent_info.output_tools:
+            schema_hint = json.dumps([t.parameters_json_schema for t in agent_info.output_tools])
+            chat.append(
+                {
+                    "role": "system",
+                    "content": [{
+                        "type": "text",
+                        "text": (
+                            "Respond with ONLY a single JSON object matching this "
+                            f"schema, no prose, no markdown fences: {schema_hint}"
+                        ),
+                    }],
+                }
+            )
+
+        inputs = processor.apply_chat_template(
+            chat,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(model.device)
+
+        tokenizer = getattr(processor, "tokenizer", processor)
+        return inputs, tokenizer
+
+    def generation_kwargs(self, inputs, tokenizer) -> dict:
         return dict(
             **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=temperature > 0,
-            temperature=max(temperature, 1e-5),
-            repetition_penalty=1.15,
-            stop_strings=["</tool_call>"],
+            max_new_tokens=self.max_new_tokens,
+            do_sample=self.temperature > 0,
+            temperature=max(self.temperature, 1e-5),
+            repetition_penalty=self.REPETITION_PENALTY,
+            stop_strings=self.STOP_STRINGS,
             tokenizer=tokenizer
         )
 
-    def run(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
-        model, processor = load(model_id, processor_path, load_in_4bit)
-        inputs, tokenizer = build_chat_and_inputs(
-            model, processor, model_id, messages, agent_info, reference_images
-        )
+    def generate(self, messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+        model, processor = self.load()
+        inputs, tokenizer = self.build_inputs(model, processor, messages, agent_info)
 
-        generated_ids = model.generate(**out_kwargs(inputs, tokenizer))
+        generated_ids = model.generate(**self.generation_kwargs(inputs, tokenizer))
         trimmed = [
             out_ids[len(in_ids):]
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -310,160 +402,137 @@ def make_model(
                 tool_name = call_data["name"]
                 tool_args = call_data.get("arguments", {})
                 tool_call_id = str(uuid.uuid4())
-                log.info(f"[{model_id}] Tool call detected -> {tool_name}({tool_args})")
+                log.info(f"[{self.model_id}] Tool call detected -> {tool_name}({tool_args})")
                 return ModelResponse(
                     parts=[ToolCallPart(tool_name=tool_name, args=tool_args, tool_call_id=tool_call_id)]
                 )
             except (json.JSONDecodeError, KeyError) as e:
-                log.info(f"[{model_id}] Malformed tool_call block, treating as plain text: {e}")
+                log.info(f"[{self.model_id}] Malformed tool_call block, treating as plain text: {e}")
 
-        log.info(f"[{model_id}] Final text answer ({len(output_text)} chars), no tool call")
+        log.info(f"[{self.model_id}] Final text answer ({len(output_text)} chars), no tool call")
         return ModelResponse(parts=[TextPart(content=output_text)])
 
-    async def stream_run(messages: list[ModelMessage], agent_info: AgentInfo):
-        buffer = ""
-        past_think = False
+    @staticmethod
+    def run_generation(model, gen_kwargs: dict, streamer, gen_error: list[BaseException]) -> None:
         try:
-            model, processor = load(model_id, processor_path, load_in_4bit)
-            inputs, tokenizer = build_chat_and_inputs(
-                model, processor, model_id, messages, agent_info, reference_images
+            model.generate(**gen_kwargs)
+        except BaseException as e:
+            gen_error.append(e)
+        finally:
+            streamer.end()
+
+    async def read_chunks(self, streamer, gen_error: list[BaseException]):
+        sentinel = object()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    asyncio.to_thread(next, streamer, sentinel), timeout=self.CHUNK_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    f"[{self.model_id}] (stream) No token received for {self.CHUNK_TIMEOUT_S:.0f}s — "
+                    "treating generation as stalled."
+                )
+                gen_error.append(TimeoutError(f"Generation stalled for over {self.CHUNK_TIMEOUT_S:.0f}s"))
+                return
+            if chunk is sentinel:
+                return
+            yield chunk
+
+    def tool_call_delta(self, final_text: str) -> Optional[dict]:
+        match = TOOL_CALL_RE.search(final_text)
+        if not match:
+            return None
+        try:
+            call_data = json.loads(match.group(1))
+            tool_call_id = str(uuid.uuid4())
+            log.info(f"[{self.model_id}] (stream) Tool call detected -> {call_data.get('name')}")
+            return {
+                0: DeltaToolCall(
+                    name=call_data["name"],
+                    json_args=json.dumps(call_data.get("arguments", {})),
+                    tool_call_id=tool_call_id
+                )
+            }
+        except (json.JSONDecodeError, KeyError) as e:
+            log.info(f"[{self.model_id}] (stream) Malformed tool_call block, falling back to text: {e}")
+            return None
+
+    def failure_text(self, parser: StreamParser, gen_error: list[BaseException]) -> str:
+        if gen_error:
+            log.warning(f"[{self.model_id}] (stream) Generation failed: {gen_error[0]!r}")
+            return (
+                "FAILURE: Generation failed before producing an answer "
+                f"({type(gen_error[0]).__name__}: {gen_error[0]}). Try again."
             )
+        if not parser.past_think:
+            log.warning(
+                f"[{self.model_id}] (stream) Hit max_new_tokens ({self.max_new_tokens}) "
+                "while still inside <think>;no final answer was produced."
+            )
+            return (
+                "FAILURE: The model ran out of its generation budget while still "
+                "reasoning and never produced a final answer. Try again, or "
+                "increase `max_new_tokens` for this agent."
+            )
+        log.warning(
+            f"[{self.model_id}] (stream) Reached </think> but produced no "
+            "usable final-answer text before generation ended."
+        )
+        return (
+            "FAILURE: The model finished reasoning but generation ended "
+            "before it wrote a final answer. Try again, or increase "
+            "`max_new_tokens` for this agent."
+        )
+
+    async def stream(self, messages: list[ModelMessage], agent_info: AgentInfo):
+        try:
+            model, processor = self.load()
+            inputs, tokenizer = self.build_inputs(model, processor, messages, agent_info)
 
             streamer = TextIteratorStreamer(
                 tokenizer, skip_prompt=True, skip_special_tokens=False
             )
-            gen_kwargs = {**out_kwargs(inputs, tokenizer), "streamer": streamer}
+            gen_kwargs = {**self.generation_kwargs(inputs, tokenizer), "streamer": streamer}
             gen_error: list[BaseException] = []
-
-            def generate():
-                try:
-                    model.generate(**gen_kwargs)
-                except BaseException as e:
-                    gen_error.append(e)
-                finally:
-                    streamer.end()
-
-            gen_thread = threading.Thread(target=generate, daemon=True)
+            gen_thread = threading.Thread(
+                target=self.run_generation, args=(model, gen_kwargs, streamer, gen_error), daemon=True
+            )
             gen_thread.start()
 
-            mode: Optional[str] = None   
-            already_yielded_len = 0      
-            yielded_anything = False     
-            TOOL_CALL_PREFIX = "<tool_call>"
-            sentinel = object()
-            CHUNK_TIMEOUT_S = 300.0
-
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(
-                        asyncio.to_thread(next, streamer, sentinel), timeout=CHUNK_TIMEOUT_S
-                    )
-                except asyncio.TimeoutError:
-                    log.warning(
-                        f"[{model_id}] (stream) No token received for {CHUNK_TIMEOUT_S:.0f}s — "
-                        "treating generation as stalled."
-                    )
-                    gen_error.append(TimeoutError(f"Generation stalled for over {CHUNK_TIMEOUT_S:.0f}s"))
-                    break
-                if chunk is sentinel:
-                    break
-                buffer += chunk
-
-                if not past_think:
-                    if "</think>" not in buffer:
-                        continue  
-                    past_think = True
-
-                after = buffer.split("</think>", 1)[1]
-
-                if mode is None:
-                    stripped = after.lstrip()
-                    if not stripped:
-                        continue 
-                    if stripped.startswith(TOOL_CALL_PREFIX):
-                        mode = "tool_call"
-                        continue 
-                    if TOOL_CALL_PREFIX.startswith(stripped):
-                        continue 
-                    mode = "text"
-                    already_yielded_len = len(after)
-                    visible = replace_special_tokens(after, tokenizer)
+            parser = StreamParser(tokenizer)
+            async with aclosing(self.read_chunks(streamer, gen_error)) as chunks:
+                async for chunk in chunks:
+                    visible = parser.feed(chunk)
                     if visible:
-                        yielded_anything = True
-                        yield visible
-                    continue
-
-                if mode == "text":
-                    new_part = after[already_yielded_len:]
-                    already_yielded_len = len(after)
-                    visible = replace_special_tokens(new_part, tokenizer)
-                    if visible:
-                        yielded_anything = True
                         yield visible
 
             gen_thread.join(timeout=10.0)
             if gen_thread.is_alive():
                 log.warning(
-                    f"[{model_id}] (stream) Generation thread still alive "
-                    "10s after stall/completion was detected — abandoning "
+                    f"[{self.model_id}] (stream) Generation thread still alive "
+                    "10s after stall/completion was detected; abandoning "
                     "it and returning the fallback response."
                 )
 
-            if mode == "tool_call" or (mode is None and "<tool_call>" in buffer):
-                final_text = strip_special_tokens(strip_thinking(buffer), tokenizer)
-                match = TOOL_CALL_RE.search(final_text)
-                if match:
-                    try:
-                        call_data = json.loads(match.group(1))
-                        tool_call_id = str(uuid.uuid4())
-                        log.info(f"[{model_id}] (stream) Tool call detected -> {call_data.get('name')}")
-                        yield {
-                            0: DeltaToolCall(
-                                name=call_data["name"],
-                                json_args=json.dumps(call_data.get("arguments", {})),
-                                tool_call_id=tool_call_id
-                            )
-                        }
-                        return
-                    except (json.JSONDecodeError, KeyError) as e:
-                        log.info(f"[{model_id}] (stream) Malformed tool_call block, falling back to text: {e}")
-
+            if parser.has_tool_call:
+                final_text = strip_special_tokens(strip_thinking(parser.buffer), tokenizer)
+                delta = self.tool_call_delta(final_text)
+                if delta is not None:
+                    yield delta
+                    return
                 if final_text:
-                    yielded_anything = True
+                    parser.yielded_anything = True
                     yield final_text
 
-            if not yielded_anything:
-                if gen_error:
-                    log.warning(f"[{model_id}] (stream) Generation failed: {gen_error[0]!r}")
-                    yield (
-                        "FAILURE: Generation failed before producing an answer "
-                        f"({type(gen_error[0]).__name__}: {gen_error[0]}). Try again."
-                    )
-                elif not past_think:
-                    log.warning(
-                        f"[{model_id}] (stream) Hit max_new_tokens ({max_new_tokens}) "
-                        "while still inside <think> — no final answer was produced."
-                    )
-                    yield (
-                        "FAILURE: The model ran out of its generation budget while still "
-                        "reasoning and never produced a final answer. Try again, or "
-                        "increase `max_new_tokens` for this agent."
-                    )
-                else:
-                    log.warning(
-                        f"[{model_id}] (stream) Reached </think> but produced no "
-                        "usable final-answer text before generation ended."
-                    )
-                    yield (
-                        "FAILURE: The model finished reasoning but generation ended "
-                        "before it wrote a final answer. Try again, or increase "
-                        "`max_new_tokens` for this agent."
-                    )
+            if not parser.yielded_anything:
+                yield self.failure_text(parser, gen_error)
 
-            log.info(f"[{model_id}] (stream) Done ({len(buffer)} raw chars)")
+            log.info(f"[{self.model_id}] (stream) Done ({len(parser.buffer)} raw chars)")
 
         except Exception as e:
-            log.exception(f"[{model_id}] (stream) Unhandled error in stream_run")
+            log.exception(f"[{self.model_id}] (stream) Unhandled error in stream_run")
             yield f"FAILURE: Internal error while generating this agent's response: {type(e).__name__}: {e}._"
 
-    return FunctionModel(run, stream_function=stream_run, model_name=model_id)
+    def function_model(self) -> FunctionModel:
+        return FunctionModel(self.generate, stream_function=self.stream, model_name=self.model_id)

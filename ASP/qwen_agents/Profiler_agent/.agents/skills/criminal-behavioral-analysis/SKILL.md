@@ -26,14 +26,17 @@ description: Behavioral/criminal profiling skill for the Profiler agent — read
 1. **Read the case image(s) and the Forensic agent's report** (and any RAG
    grounding excerpts) already present in your prompt.
 2. **(Optional) Go deeper**: if the 5 short reference images aren't
-   sufficient, use `read_file` on `references/REFERENCE.md` for the
-   "Advanced version" — descriptions of the classification frameworks in
-   more depth — or on the image descriptions under `assets/long/`. This
-   step is optional; use your judgment.
+   sufficient, use the image viewer tools for the "Advanced version"
+   (23 images under `assets/long/`, grouped into 6 sections). Call
+   `list_sections` for the sections and a description of every image,
+   then `view_section` to see the images of one section (a few at a time;
+   pass `offset` for the next batch), or `view_image` for a single image.
+   This step is optional; use your judgment.
 3. **Build the Crime Scene Report**: analyze every detail across the
    images for irregularities that don't match how the scene would look in
    real life (e.g. a living room, park, or other setting), comparing
-   against the frameworks in `references/REFERENCE.md`.
+   against the frameworks in the 5 short reference images (and any
+   Advanced version images you viewed).
 4. **Use the Forensic agent's report as evidence, not as your own
    conclusion**: you are not deriving cause/manner of death yourself —
    treat its findings (and any RAG-grounded reference material) as input

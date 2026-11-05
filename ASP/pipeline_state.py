@@ -8,7 +8,7 @@ from contextlib import aclosing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
-import db
+from db import CheckpointDB, checkpoint_db
 
 log = logging.getLogger("pipeline_state")
 
@@ -90,8 +90,9 @@ def join_continuation(prefix: str, new: str) -> str:
     return base + "\n\n" + new
 
 class CaseStore:
-    def __init__(self, case_id: str):
+    def __init__(self, case_id: str, db: CheckpointDB = checkpoint_db):
         self.case_id = case_id
+        self.db = db
         self.ok = True
         self.error: Optional[str] = None
 
@@ -108,19 +109,19 @@ class CaseStore:
             return default
 
     def status_suffix(self) -> str:
-        return "" if self.ok else "(database unavailable — progress is NOT being saved)"
+        return "" if self.ok else "(database unavailable; progress is NOT being saved)"
 
     async def load_all(self) -> dict:
-        return await self.pipeline_run(db.load_steps(self.case_id), default={}) or {}
+        return await self.pipeline_run(self.db.load_steps(self.case_id), default={}) or {}
 
     async def delete_all(self) -> None:
-        await self.pipeline_run(db.forget_case(self.case_id))
+        await self.pipeline_run(self.db.forget_case(self.case_id))
 
     async def save(self, step: str, content: str, status: str) -> None:
-        await self.pipeline_run(db.save_step(self.case_id, step, content, status))
+        await self.pipeline_run(self.db.save_step(self.case_id, step, content, status))
 
     async def invalidate(self, steps: list[str]) -> None:
-        await self.pipeline_run(db.delete_steps(self.case_id, steps))
+        await self.pipeline_run(self.db.delete_steps(self.case_id, steps))
 
     async def load_meta(self) -> Optional[dict]:
         steps = await self.load_all()
@@ -169,7 +170,7 @@ def describe_case(row: dict) -> str:
 
 async def list_cases_safe(limit: int = 25) -> list[dict]:
     try:
-        return await asyncio.wait_for(db.list_cases(limit), timeout=STORE_TIMEOUT_S)
+        return await asyncio.wait_for(checkpoint_db.list_cases(limit), timeout=STORE_TIMEOUT_S)
     except Exception as e:                            
         log.warning(f"Could not list saved cases (Postgres unavailable): {e}")
         return []

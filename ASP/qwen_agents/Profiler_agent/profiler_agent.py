@@ -1,10 +1,15 @@
+import logging
 import os
+import sys
 from pathlib import Path
 from fastmcp.client import Client as FastMCPClient
 from fastmcp.client.transports import StdioTransport
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.mcp import MCPToolset
-from qwen_agents.model_utils import make_model
+from qwen_agents.model_utils import QwenVLModel
+from reference_version import ADVANCED, BASIC, version_from_messages
+
+log = logging.getLogger(__name__)
 
 PROFILER_MODEL_ID = os.getenv(
     "PROFILER_MODEL_ID", "Kizzington/Qwen3-VL-8B-Thinking-heretic"
@@ -21,18 +26,23 @@ PROFILER_SKILL = CBA_SKILL_DIR / "SKILL.md"
 SHORT_REFERENCE_IMAGES = sorted(
     (CBA_SKILL_DIR / "assets" / "short").glob("*.jpg")
 )
+ADVANCED_IMAGE_COUNT = len(list((CBA_SKILL_DIR / "assets" / "long").rglob("*.jpg")))
+
+IMAGE_VIEWER_SERVER = Path(__file__).parent / "image_viewer_mcp.py"
 
 skills_client = FastMCPClient(
     StdioTransport(
-        command="npx",
-        args=["-y", "@modelcontextprotocol/server-filesystem", str(SKILLS_DIR)],
+        command=sys.executable,
+        args=[str(IMAGE_VIEWER_SERVER), str(CBA_SKILL_DIR)],
         env={**os.environ}
     ),
     init_timeout=60
 )
-ALLOWED_SKILL_TOOLS = {"read_file", "list_directory"}
+ALLOWED_SKILL_TOOLS = {"list_sections", "view_section", "view_image"}
 skills_toolset = MCPToolset(skills_client).filtered(
-    lambda ctx, tool_def: tool_def.name in ALLOWED_SKILL_TOOLS
+    lambda ctx, tool_def: (
+        tool_def.name in ALLOWED_SKILL_TOOLS and version_from_messages(ctx.messages) != BASIC
+    )
 )
 
 
@@ -42,7 +52,7 @@ def load_skill_text(path: Path) -> str:
     except FileNotFoundError as e:
         raise RuntimeError(
             f"Profiler agent's required skill file is missing: {path} "
-            "— this file defines the agent's core workflow and output "
+            "this file defines the agent's core workflow and output "
             "format; the agent cannot run correctly without it."
         ) from e
 
@@ -52,14 +62,14 @@ OUTPUT_MD = load_skill_text(CBA_SKILL_DIR / "references" / "OUTPUT.md")
 
 
 profiler_agent: Agent[None, str] = Agent(
-    model=make_model(
+    model=QwenVLModel(
         PROFILER_MODEL_ID,
         processor_path="Qwen/Qwen3-VL-8B-Thinking",
         reference_images=SHORT_REFERENCE_IMAGES,
         temperature=0.3,
         max_new_tokens=12288,
         load_in_4bit=PROFILER_LOAD_IN_4BIT
-    ),
+    ).function_model(),
     system_prompt=(
         "You are a criminal behavioral profiler analyzing case images plus "
         "a Forensic agent's report (received via A2A).\n\n"
@@ -88,14 +98,16 @@ profiler_agent: Agent[None, str] = Agent(
         "--- Your skill file (criminal-behavioral-analysis/SKILL.md) ---\n"
         "This defines your workflow. It is included here directly so you "
         "always have it regardless of whether you call any tool — you may "
-        "still optionally use read_file to go deeper into references/ or "
-        "assets/long/ as it describes below.\n\n"
-        f"TOOL RULES: your only tools are read_file and list_directory, and they can ONLY "
-        f"read inside {SKILLS_DIR}. Use absolute paths under that folder, for example "
-        f"{CBA_SKILL_DIR}/references/REFERENCE.md. The case images are ALREADY attached "
-        "to this message: never try to open, locate or re-read them with a tool, and "
-        "never invent file paths such as /data/.... If a tool returns an error, do NOT "
-        "repeat the same call; continue with what you already have.\n\n"
+        "still optionally use the image viewer tools to go deeper into the "
+        "Advanced version images as it describes below.\n\n"
+        f"TOOL RULES: your only tools are list_sections, view_section and view_image, "
+        f"and they only show the {ADVANCED_IMAGE_COUNT} Advanced version reference images. "
+        "list_sections lists the sections with a description of each image; view_section "
+        "returns the actual images of one section (a few at a time, use offset to page); "
+        "view_image returns one image by the path list_sections gave you. The case images "
+        "are ALREADY attached to this message: never try to open, locate or re-read them "
+        "with a tool, and never invent file paths such as /data/.... If a tool returns an "
+        "error, do NOT repeat the same call; continue with what you already have.\n\n"
         f"{SKILL_MD}\n\n"
         "--- Your required output format (references/OUTPUT.md), verbatim ---\n"
         "You MUST use exactly these Markdown sections, in this order:\n\n"
@@ -113,3 +125,17 @@ profiler_agent: Agent[None, str] = Agent(
     toolsets=[skills_toolset],
     retries=4
 )
+
+
+@profiler_agent.output_validator
+def warn_if_advanced_unused(ctx: RunContext[None], output: str) -> str:
+    if version_from_messages(ctx.messages) == ADVANCED:
+        viewed = any(
+            getattr(part, "tool_name", None) in ALLOWED_SKILL_TOOLS
+            for message in ctx.messages
+            for part in getattr(message, "parts", ())
+            if getattr(part, "part_kind", None) == "tool-call"
+        )
+        if not viewed:
+            log.warning("Advanced reference version was selected but the model never viewed an Advanced page")
+    return output
