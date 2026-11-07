@@ -1,6 +1,6 @@
 # Agentic_Serial-killer_Profiler
 
-A two-agent, multimodal pipeline that turns case photographs into a structured forensic report and then, a behavioral profile. Both agents are built on **Qwen3-VL-8B-Thinking**, run locally, and talk to each other over the **A2A (Agent-to-Agent)** protocol. A **Gradio** app drives the workflow, **PostgreSQL** checkpoints every step so interrupted runs can resume, and a local **RAG** layer adds reference summaries on injury types for educational purposes.
+A two-agent, multimodal pipeline that turns case photographs into a structured forensic report and finally, a behavioral profile. Both agents are built on **Qwen3-VL-8B-Thinking**, run locally, and talk to each other over the **A2A (Agent-to-Agent)** protocol. A **Gradio** app drives the workflow, **PostgreSQL** checkpoints every step so interrupted runs can resume, and a local **RAG** layer adds reference summaries on injury types for educational purposes.
 
 > **Prototype for research and education.** Outputs can be wrong and must never be treated as forensic findings, evidence, or a basis for accusing anyone. See [Disclaimer](#disclaimer).
 
